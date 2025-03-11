@@ -1,0 +1,27 @@
+[tool.poetry]
+name = "dacon-hansoldeco-season3"
+version = "0.1.0"
+description = "DACON - 건설공사 사고 예방 및 대응책 생성 : 한솔데코 시즌3 AI 경진대회"
+authors = ["Jeongwon <banb3515@gmail.com>"]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+openai = ">=1.52.0"
+vllm = "^0.7.3"
+pandas = "^2.2.3"
+tqdm = "^4.67.1"
+langchain = "^0.3.20"
+langchain-community = "^0.3.19"
+faiss-gpu = "^1.7.2"
+langchain-huggingface = "^0.1.2"
+python-dotenv = "^1.0.1"
+datasets = "^3.3.2"
+sentence-transformers = "^3.4.1"
+
+[tool.poetry.group.dev.dependencies]
+black = "^23.9.1"
+isort = "^5.12.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

@@ -1,0 +1,8 @@
+cache/
+data/
+faiss/
+logs/
+
+.env
+output.log
+nohup.log
