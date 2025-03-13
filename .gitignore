@@ -2,6 +2,7 @@ cache/
 data/
 faiss/
 logs/
+submissions/
 
 .env
 output.log

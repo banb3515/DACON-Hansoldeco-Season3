@@ -1,7 +1,6 @@
 import builtins
 import os
 import json
-import glob
 import torch
 import logging
 import pandas as pd
@@ -9,7 +8,7 @@ import numpy as np
 
 from dotenv import load_dotenv
 
-from typing import Literal, Optional
+from typing import Literal
 
 from string import Template
 
@@ -99,23 +98,20 @@ def create_combined_data(df: pd.DataFrame, is_train: bool = True) -> pd.DataFram
     Args:
         df (pd.DataFrame): raw data
         is_train (bool, optional): whether the data is train data. Defaults to True.
-    
+
     Returns:
         pd.DataFrame: combined data
     """
     
     combined_data = df.apply(
         lambda row: {
-            "question": json.dumps({
-                "공사종류(대분류)": row["공사종류(대분류)"],
-                "공사종류(중분류)": row["공사종류(중분류)"],
-                "공종(대분류)": row["공종(대분류)"],
-                "공종(중분류)": row["공종(중분류)"],
-                "사고객체(대분류)": row["사고객체(대분류)"],
-                "사고객체(중분류)": row["사고객체(중분류)"],
-                "작업프로세스": row["작업프로세스"],
-                "사고원인": row["사고원인"]
-            }, ensure_ascii=False, indent=2),
+            "question": (
+                f"공사종류 대분류 '{row['공사종류(대분류)']}', 중분류 '{row['공사종류(중분류)']}' 공사 중 "
+                f"공종 대분류 '{row['공종(대분류)']}', 중분류 '{row['공종(중분류)']}' 작업에서 "
+                f"사고객체 '{row['사고객체(대분류)']}'(중분류: '{row['사고객체(중분류)']}')와 관련된 사고가 발생했습니다. "
+                f"작업 프로세스는 '{row['작업프로세스']}'이며, 사고 원인은 '{row['사고원인']}'입니다. "
+                f"재발 방지 대책 및 향후 조치 계획은 무엇인가요?"
+            ),
             **({"answer": row["재발방지대책 및 향후조치계획"]} if is_train else {})
         },
         axis=1
@@ -165,7 +161,7 @@ def load_llm_model(model_name: str, **kwargs) -> LLM:
 
 #region 3. Main Tasks
 
-def create_case_documents(data: pd.DataFrame) -> list[Document]:
+def create_train_documents(data: pd.DataFrame) -> list[Document]:
     """Create train documents
 
     Args:
@@ -180,19 +176,14 @@ def create_case_documents(data: pd.DataFrame) -> list[Document]:
     
     return [
         Document(f"""\
-# 건설공사 사고 상황 데이터
-```json
-{question}
-```
-
-# 재발 방지 대책 및 향후 조치 계획
-{answer}\
+<question>{question}</question>
+<answer>{answer}</answer>\
 """)
         for question, answer in zip(train_questions, train_answers)
     ]
 
 def create_retriever(
-    documents: Optional[list[Document]],
+    documents: list[Document],
     embedding: Embeddings,
     cache_path: str,
     path: str,
@@ -217,34 +208,22 @@ def create_retriever(
         VectorStoreRetriever: retriever
     """
     
-    vectorstore = None
+    embedding_store = LocalFileStore(cache_path)
+    cached_embedder = CacheBackedEmbeddings.from_bytes_store(embedding, embedding_store, namespace=f"{index_name}_embed-")
     
-    if documents is None:
-        # Load existing index
-        faiss_index_path = f"{os.path.join(path, index_name)}.*"
-        if len(glob.glob(faiss_index_path)) == 0:
-            raise FileNotFoundError(f"Index file not found: {faiss_index_path}")
-        
-        vectorstore = FAISS.load_local(path, embedding, index_name, allow_dangerous_deserialization=True)
-    else:
-        # Create new index
-        embedding_store = LocalFileStore(cache_path)
-        cached_embedder = CacheBackedEmbeddings.from_bytes_store(embedding, embedding_store, namespace=f"{index_name}_embed-")
-        
-        embedding_texts = []
-        embedding_datas = []
-        metadatas = []
-        
-        for doc in tqdm(documents, desc="Embedding documents"):
-            embedding_vector = cached_embedder.embed_documents([doc.page_content])
-            embedding_texts.append(doc.page_content)
-            embedding_datas.extend(embedding_vector)
-            metadatas.append(doc.metadata)
-        
-        vectorstore = FAISS.from_embeddings(zip(embedding_texts, embedding_datas), embedding, metadatas=metadatas)
-        vectorstore.save_local(path, index_name)
+    embedding_texts = []
+    embedding_datas = []
+    metadatas = []
     
-    # Create retriever
+    for doc in tqdm(documents, desc="Embedding documents"):
+        embedding_vector = cached_embedder.embed_documents([doc.page_content])
+        embedding_texts.append(doc.page_content)
+        embedding_datas.extend(embedding_vector)
+        metadatas.append(doc.metadata)
+    
+    vectorstore = FAISS.from_embeddings(zip(embedding_texts, embedding_datas), embedding, metadatas=metadatas)
+    vectorstore.save_local(path, index_name)
+    
     search_kwargs = {"k": k}
     if search_type == "mmr":
         search_kwargs.update({
@@ -258,8 +237,7 @@ def create_retriever(
     )
 
 def exec_test(
-    guideline_retriever: VectorStoreRetriever,
-    case_retriever: VectorStoreRetriever,
+    retriever: VectorStoreRetriever,
     reasoning_model: LLM,
     chat_model: LLM,
     reasoning_sampling_params: SamplingParams,
@@ -281,73 +259,56 @@ def exec_test(
     """
     
     REASONING_SYSTEM_PROMPT = Template("""\
-# Role
+<role>
 You are a construction safety expert.
-
-# Rules
-- Always think in English.
-- Analyze the cause of the accident and suggest specific preventive measures accordingly.
-- Analyze the response patterns of previous cases provided to think about how to respond effectively.
-- Refer to the provided construction safety guidelines to analyze the cause of the accident and suggest preventive measures.
-- Include approaches that comply with the regulations and instructions specified in the construction safety guidelines.
-
-# Construction Safety Guidelines
-<guidelines>
-${guidelines}
-</guidelines>
-
-# Cases
-<cases>
-${cases}
-</cases>\
+</role>
+<rules>
+- Always respond in English.
+- Summarize only the core content of the answer concisely.
+- Never include introductions, background, or additional explanations.
+- Do not include phrases such as "We suggest taking the following actions:".
+- Clearly list safety measures and action plans.
+- Provide the answer in a single sentence as presented in the provided examples.
+- Base your answer on the provided examples.
+</rules>
+<examples>
+${examples}
+</examples>\
 """)
     CHAT_SYSTEM_PROMPT = Template("""\
-# Role
+<role>
 당신은 건설 안전 전문가입니다.
-
-# Rules
+</role>
+<rules>
 - 항상 한국어로 답변하세요.
-- 서론, 배경 설명, 추가 설명 없이 이전 사례와 동일한 형식으로 간결하게 답변하세요.
-- 제공된 이전 사례의 응답 패턴을 분석하여 답변하세요.
-- 추론 모델이 분석한 내용을 참고하여 제공된 예시 자료와 같은 형식으로 한 문장의 답변을 작성하세요.
-- 건설 안전 지침에 명시된 규정과 지시사항을 준수하는 접근 방식을 포함하세요.
-- 건설 안전 지침을 참고하여 사고 원인을 분석하고 예방 대책을 제시하세요.
-
-# Construction Safety Guidelines
-<guidelines>
-${guidelines}
-</guidelines>
-
-# Cases
-<cases>
-${cases}
-</cases>
-
-# Reasoning Results
-${reasoning}\
+- 질문에 대한 답변을 핵심 내용만 요약하여 간략하게 작성하세요.
+- 서론, 배경 설명 또는 추가 설명을 절대 포함하지 마세요.
+- 다음과 같은 조치를 취할 것을 제안합니다: 와 같은 내용을 포함하지 마세요.
+- 안전 대책과 조치 계획을 명확하게 나열하세요.
+- 제공된 예시 자료를 기반으로 답변하세요.
+- <think> 태그 내용을 참조하여 제공된 예시 자료와 같이 한 문장으로 답변을 작성하세요.
+- 답변 끝에 "한다.", "합니다" 등 조동사를 포함하지 마세요.
+</rules>
+<examples>
+${examples}
+</examples>
+<think>
+${think}
+</think>
 """)
     
     
     def _inference(question: str):
-        guideline_contexts = guideline_retriever.invoke(question)
-        case_contexts = case_retriever.invoke(question)
-        
-        guidelines = [
-            f"<guideline>\n{context.page_content}\n</guideline>"
-            for context in guideline_contexts
-        ]
-        cases = [
-            f"<case>\n{context.page_content}\n</case>"
-            for context in case_contexts
+        contexts = retriever.invoke(question)
+        examples = [
+            f"<example>\n{context.page_content}\n</example>"
+            for context in contexts
         ]
         
         # TODO: Reranking 모델 적용
         
         # Reasoning
-        reasoning_prompt = REASONING_SYSTEM_PROMPT.substitute(
-            guidelines="\n".join(guidelines),
-            cases="\n".join(cases)
-        )
+        reasoning_prompt = REASONING_SYSTEM_PROMPT.substitute(examples="\n".join(examples))
         reasoning_output = reasoning_model.chat(
             [
                 {"role": "system", "content": reasoning_prompt},
@@ -361,21 +322,12 @@ ${reasoning}\
         print(f"# Reasoning:\n{reasoning_text}")
         
         # Chat
-        chat_prompt = CHAT_SYSTEM_PROMPT.substitute(
-            guidelines="\n".join(guidelines),
-            cases="\n".join(cases),
-            reasoning=reasoning_text
-        )
+        chat_prompt = CHAT_SYSTEM_PROMPT.substitute(examples="\n".join(examples), think=reasoning_text)
         chat_output = chat_model.chat(
             [
                 {"role": "system", "content": chat_prompt},
-                {"role": "user", "content": f"""\
-# 건설공사 사고 상황 데이터
-```json
-{question}
-```\
-"""},
-                {"role": "assistant", "content": f"# 재발 방지 대책 및 향후 조치 계획\n"}
+                {"role": "user", "content": question},
+                {"role": "assistant", "content": f"작업전 안전교육 실시와 안전관리자 안전점검 실시를 통한 재발 방지 대책 및 향후 조치 계획: "}
             ],
             sampling_params=chat_sampling_params,
             use_tqdm=False
@@ -448,12 +400,10 @@ if __name__ == "__main__":
     SUBMISSIONS_DIR = os.getenv("SUBMISSIONS_DIR", "./submissions")
     CACHE_PATH = os.getenv("CACHE_PATH", "./cache")
     FAISS_PATH = os.getenv("FAISS_PATH", "./faiss")
-    FAISS_GUIDELINE_INDEX_NAME = os.getenv("FAISS_GUIDELINE_INDEX_NAME", "dacon_guideline")
-    FAISS_CASE_INDEX_NAME = os.getenv("FAISS_CASE_INDEX_NAME", "dacon_case")
+    FAISS_INDEX_NAME = os.getenv("FAISS_INDEX_NAME", "dacon")
     
     EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME")
-    GUIDELINE_SEARCH_OPTIONS = json.loads(os.getenv("GUIDELINE_SEARCH_OPTIONS"))
-    CASE_SEARCH_OPTIONS = json.loads(os.getenv("CASE_SEARCH_OPTIONS"))
+    SEARCH_OPTIONS = json.loads(os.getenv("SEARCH_OPTIONS"))
     
     REASONING_MODEL_NAME = os.getenv("REASONING_MODEL_NAME")
     REASONING_MODEL_OPTIONS = json.loads(os.getenv("REASONING_MODEL_OPTIONS", "{}"))
@@ -486,30 +436,19 @@ if __name__ == "__main__":
         encode_kwargs={"normalize_embeddings": True}
     )
     
-    # Create Case Documents
-    print("📄 Create case documents ...")
-    case_documents = create_case_documents(combined_train_data)
+    # Create Train Documents
+    print("📄 Create train documents ...")
+    train_documents = create_train_documents(combined_train_data)
     
-    # Create Guideline Retriever
-    print("🔍 Create guideline retriever ...")
-    guideline_retriever = create_retriever(
-        None,
+    # Create Retriever
+    print("🔍 Create retriever ...")
+    retriever = create_retriever(
+        train_documents,
         embedding,
         CACHE_PATH,
         FAISS_PATH,
-        FAISS_GUIDELINE_INDEX_NAME,
-        **GUIDELINE_SEARCH_OPTIONS
-    )
-    
-    # Create Case Retriever
-    print("🔍 Create case retriever ...")
-    case_retriever = create_retriever(
-        case_documents,
-        embedding,
-        CACHE_PATH,
-        FAISS_PATH,
-        FAISS_CASE_INDEX_NAME,
-        **CASE_SEARCH_OPTIONS
+        FAISS_INDEX_NAME,
+        **SEARCH_OPTIONS
     )
     
     # Reasoning Model Loading
@@ -531,13 +470,12 @@ if __name__ == "__main__":
     # Execute Test
     print("🧪 Testing execution ...")
     results = exec_test(
-        guideline_retriever=guideline_retriever,
-        case_retriever=case_retriever,
-        reasoning_model=reasoning_model,
-        chat_model=chat_model,
-        reasoning_sampling_params=reasoning_sampling_params,
-        chat_sampling_params=chat_sampling_params,
-        data=combined_test_data,
+        retriever,
+        reasoning_model,
+        chat_model,
+        reasoning_sampling_params,
+        chat_sampling_params,
+        combined_test_data,
     )
     
     # Create Result Embeddings
